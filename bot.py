@@ -1,0 +1,185 @@
+import asyncio, io, os, re, logging
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ImageDraw, ImageFont
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+logging.basicConfig(level=logging.INFO)
+BASE = os.path.dirname(os.path.abspath(__file__))
+TOKEN = os.environ["BOT_TOKEN"]
+ALLOWED = {int(x) for x in os.environ.get("ALLOWED_IDS", "").split(",") if x.strip()}
+TEAM = os.environ.get("TEAM_NAME", "REDRAGON").upper()
+URL_RE = re.compile(r"https?://eternalesports\.club/lobbies/\S+")
+GAME_RE = re.compile(r"^(\d+)(?:st|nd|rd|th)$")
+
+# ---------- парсинг страницы ----------
+def fetch_lines(url):
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    return [l.strip() for l in soup.get_text("\n").splitlines() if l.strip()]
+
+def read_pts(lines, j):
+    """'6 pts' в одной строке или '6' + 'pts' в двух. Возвращает (очки, сколько строк занято)."""
+    if j >= len(lines):
+        return None
+    m = re.fullmatch(r"(\d+)\s*pts?", lines[j])
+    if m:
+        return int(m.group(1)), 1
+    if re.fullmatch(r"\d+", lines[j]) and j + 1 < len(lines) and lines[j + 1].lower() == "pts":
+        return int(lines[j]), 2
+    return None
+
+def split_name_tag(s):
+    h = len(s) // 2
+    if len(s) % 2 == 0 and s[:h] == s[h:]:
+        return s[:h]
+    m = re.match(r"^(.*?[a-z\s)])([A-Z0-9]{2,6})$", s)
+    return m.group(1).strip() if m else s
+
+def parse_lines(lines):
+    teams, n = {}, len(lines)
+    for i in range(n - 3):
+        if not (re.fullmatch(r"\d{1,2}", lines[i]) and re.fullmatch(r"\d{1,3}", lines[i + 1])):
+            continue
+        rank, total = int(lines[i]), int(lines[i + 1])
+        if not 1 <= rank <= 40 or rank in teams:
+            continue
+        j, parts = i + 2, []
+        while j < n and len(parts) < 3 and not GAME_RE.match(lines[j]):
+            parts.append(lines[j]); j += 1
+        games = []
+        while j < n and GAME_RE.match(lines[j]):
+            p = read_pts(lines, j + 1)
+            if not p:
+                break
+            games.append((int(GAME_RE.match(lines[j]).group(1)), p[0])); j += 1 + p[1]
+        if not parts or not games or sum(g[1] for g in games) != total:
+            continue
+        name = parts[0] if len(parts) >= 2 else split_name_tag(parts[0])
+        teams[rank] = {"rank": rank, "name": name, "pts": total, "games": games}
+    return [teams[k] for k in sorted(teams)]
+
+# ---------- картинка ----------
+def render(table):
+    im = Image.open(os.path.join(BASE, "template.png")).convert("RGB")
+    px, d = im.load(), None
+    d = ImageDraw.Draw(im)
+    fpath = os.path.join(BASE, "Poppins-Bold.ttf")
+    if not os.path.exists(fpath):
+        fpath = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    fn, fn2, fp = (ImageFont.truetype(fpath, s) for s in (22, 19, 30))
+    cfg = [(200, 560, 598, 704, 300, 676), (900, 1300, 1310, 1395, 1000, 1372)]
+    for col, (fx0, fx1, p0, p1, nx, pr) in enumerate(cfg):
+        for i in range(10):
+            yc = 361 + i * 50.5
+            for a, b, s, ra, rb in ((fx0, fx1, fx1 - 12, int(yc - 23), int(yc + 23)),
+                                    (p0, p1, p0 - 6, int(yc - 19), int(yc + 19))):
+                for y in range(ra, rb + 1):
+                    c = px[s, y]
+                    for x in range(a, b):
+                        px[x, y] = c
+            idx = col * 10 + i
+            if idx >= len(table):
+                continue
+            t = table[idx]
+            color = (235, 35, 45) if TEAM in t["name"].upper() else (240, 240, 240)
+            f = fn if d.textlength(t["name"], font=fn) < 260 else fn2
+            d.text((nx, yc), t["name"], font=f, fill=color, anchor="lm")
+            d.text((pr, yc), str(t["pts"]), font=fp, fill=color, anchor="rm")
+    buf = io.BytesIO(); im.save(buf, "PNG"); buf.seek(0)
+    return buf
+
+# ---------- текст ----------
+ORD = {1: "первой", 2: "второй", 3: "третьей", 4: "четвёртой", 5: "пятой", 6: "шестой"}
+
+def games_phrase(nums):
+    names = [ORD.get(n, f"№{n}") for n in nums]
+    if len(names) == 1:
+        return f"в {names[0]} игре"
+    return "в " + ", ".join(names[:-1]) + f" и {names[-1]} играх"
+
+def pl(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return "поинт"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "поинта"
+    return "поинтов"
+
+def make_texts(t):
+    place, total, games = t["rank"], t["pts"], t["games"]
+    best = min(g[0] for g in games)
+    best_nums = [i + 1 for i, g in enumerate(games) if g[0] == best]
+    where = games_phrase(best_nums)
+    best_txt = f"топ {best} {where}" if best <= 3 else f"{best} место {where}"
+    half = len(games) // 2
+    first, last = sum(g[1] for g in games[:half]), sum(g[1] for g in games[half:])
+    if total and last >= 0.6 * total:
+        trend = "К концу дня парни разыгрались и набрали больше половины поинтов в последних играх"
+    elif total and first >= 0.8 * total:
+        trend = "Начало дня было уверенным, а к концу не хватило стабильности"
+    else:
+        trend = "Играли ровно на протяжении всего дня"
+    res = f"{total} {pl(total)} и {place} место"
+    if place <= 5:
+        a = f"Сегодня наши парни показали отличный результат на скримах от <b>EEC</b>: {res} 🔥\nЛучшая игра дня: {best_txt}. Так держать! 💪"
+        b = f"<b>EEC</b> скримы: {total} {pl(total)}, {place} место. {best_txt.capitalize()} 🐉"
+        c = f"Скримы от <b>EEC</b> прошли отлично! {res}. {trend}. Идём дальше 🔥"
+    elif place <= 10:
+        a = f"Сегодня наши парни выступили на скримах от <b>EEC</b> и вошли в топ 10: {res}. Лучшая игра дня: {best_txt} 🔥"
+        b = f"<b>EEC</b> скримы: {total} {pl(total)}, {place} место. {best_txt.capitalize()} 🐉"
+        c = f"Скримы от <b>EEC</b> позади: {res}. {trend}. Разбираем катки и идём дальше 💪"
+    else:
+        a = f"Сегодня наши парни сыграли на скримах от <b>EEC</b>: {res}. Лучшая игра дня: {best_txt}. {trend}. Выводы сделаем и вернёмся сильнее 💪"
+        b = f"<b>EEC</b> скримы: {total} {pl(total)}, {place} место. Разбираем катки и идём дальше 🔥"
+        c = f"Скримы от <b>EEC</b> позади. Команда набрала {total} {pl(total)} и заняла {place} место. Работаем над ошибками 🐉"
+    return [a, b, c]
+
+# ---------- Telegram ----------
+def allowed(update):
+    return not ALLOWED or (update.effective_user and update.effective_user.id in ALLOWED)
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if allowed(update):
+        await update.message.reply_text("Пришли ссылку на лобби eternalesports.club/lobbies/... и я соберу картинку и текст для поста.")
+
+async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    m = URL_RE.search(update.message.text or "")
+    if not m:
+        return
+    url, debug = m.group(0), update.message.text.startswith("/debug")
+    await update.message.reply_text("Читаю результаты…")
+    try:
+        lines = await asyncio.to_thread(fetch_lines, url)
+        table = parse_lines(lines)
+    except Exception as e:
+        await update.message.reply_text(f"Не получилось открыть страницу: {e}")
+        return
+    if not table:
+        await update.message.reply_text("Не нашёл таблицу на странице. Возможно, сайт изменил вёрстку или результаты ещё не готовы.")
+        return
+    if debug:
+        await update.message.reply_text("\n".join(f"{t['rank']}. {t['name']} — {t['pts']}" for t in table))
+        return
+    me = next((t for t in table if TEAM in t["name"].upper()), None)
+    img = await asyncio.to_thread(render, table)
+    if not me:
+        await update.message.reply_photo(img, caption=f"Команду {TEAM} в этом лобби не нашёл.")
+        return
+    texts = make_texts(me)
+    await update.message.reply_photo(img, caption=texts[0], parse_mode="HTML")
+    await update.message.reply_text("Другие варианты текста:\n\n" + texts[1] + "\n\n— — —\n\n" + texts[2], parse_mode="HTML")
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT, handle))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
